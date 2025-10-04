@@ -37,16 +37,18 @@ clone_handle :: proc(handle: Handle($T)) {
 
 load_from_path :: proc($T: typeid, path: string) -> Handle(T) {
 	res, err := try_load_from_path(T, path)
+	asset_ty: typeid = T
 	if err, has_err := err.(string); has_err {
-		fmt.panicf("Could not load asset {} from path {}: {}", T, path, err)
+		fmt.panicf("Could not load asset {} from path {}: {}", asset_ty, path, err)
 	}
 	return res
 }
 
 load_from_input :: proc($T: typeid, input: any) -> Handle(T) {
+	asset_ty: typeid = T
 	handle, err := try_load_from_input(T, input)
 	if err, has_err := err.(string); has_err {
-		fmt.panicf("Could not load asset {} from input {}: {}", T, input, err)
+		fmt.panicf("Could not load asset {} from input {}: {}", asset_ty, input, err)
 	}
 	return handle
 }
@@ -57,16 +59,20 @@ try_load_from_input :: proc($T: typeid, input: any) -> (handle: Handle(T), err: 
 
 	res: T = _load_from_input_typed(T, input) or_return
 	slotmap: ^Slotmap(T) = get_slotmap_ref(T)
-	handle = slotmap_insert(slotmap, data)
+	handle = slotmap_insert(slotmap, res)
 	asset := AssetTypeAndIdx{T, handle.idx}
-	_set_input(asset, input)
+	_insert_asset_metadata(asset, input)
 	_pop_load_scope(asset)
 
 	return handle, nil
 }
 
-_set_input :: proc(asset: AssetTypeAndIdx, input: any) {
-	meta := _get_asset_metadata(asset)
+_insert_asset_metadata :: proc(asset: AssetTypeAndIdx, input: any) {
+	_, meta, just_inserted, _ := map_entry(&MANAGER.asset_meta, asset)
+	assert(just_inserted)
+	meta.dependencies = make([dynamic]AssetTypeAndIdx)
+	meta.dependants = make([dynamic]AssetTypeAndIdx)
+
 	if meta.input.ptr != nil {
 		mem.free(meta.input.ptr)
 	}
@@ -110,6 +116,7 @@ try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(
 			if asset.asset_ty == T {
 				handle = Handle(T){asset.idx}
 				clone_handle(handle)
+				_pop_load_scope(asset, set_dependencies = false) // do not set dependencies because asset was not really loaded
 				return handle, nil
 			}
 		}
@@ -125,52 +132,50 @@ try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(
 	for a in meta2.assets do assert(a.asset_ty != T)
 	asset := AssetTypeAndIdx{T, handle.idx}
 	append(&meta2.assets, asset)
-	_set_input(asset, partial_path)
+	_insert_asset_metadata(asset, partial_path)
 	_pop_load_scope(asset)
 	return handle, nil
 }
 
 _load_from_bytes_typed :: proc($T: typeid, bytes: []u8) -> (res: T, err: Error) {
 	asset_ty: typeid = T
-	from_bytes_fn, has_bytes_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]
+	loader, has_bytes_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]
 	if !has_bytes_loader {
 		return {}, fmt.tprintf("no bytes loader ([]u8 -> {}) registered!", asset_ty)
 	}
 	bytes := bytes
-	from_bytes_fn(&bytes, &res) or_return
+	loader_load(loader, &bytes, &res) or_return
 	return res, nil
 }
 
 
 _load_from_bytes_punned :: proc(asset_ty: typeid, bytes: []u8, out: rawptr) -> (err: Error) {
-	from_bytes_fn, has_bytes_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]
+	loader, has_bytes_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]
 	if !has_bytes_loader {
 		return fmt.tprintf("no bytes loader ([]u8 -> {}) registered!", asset_ty)
 	}
 	bytes := bytes
-	from_bytes_fn(&bytes, out) or_return
-	return nil
+	return loader_load(loader, &bytes, out)
 }
 
 _load_from_input_typed :: proc($T: typeid, input: any) -> (res: T, err: Error) {
 	asset_ty: typeid = T
 	input_ty: typeid = input.id
-	loader_fn, has_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, input_ty}]
+	loader, has_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, input_ty}]
 	if !has_loader {
-		return fmt.tprintf("no input loader ({} -> {}) registered!", input_ty, asset_ty)
+		return {}, fmt.tprintf("no input loader ({} -> {}) registered!", input_ty, asset_ty)
 	}
-	loader_fn(input.data, &res) or_return
+	loader_load(loader, input.data, &res) or_return
 	return res, nil
 }
 
 _load_from_input_punned :: proc(asset_ty: typeid, input: any, out: rawptr) -> (err: Error) {
 	input_ty: typeid = input.id
-	loader_fn, has_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, input_ty}]
+	loader, has_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, input_ty}]
 	if !has_loader {
 		return fmt.tprintf("no input loader ({} -> {}) registered!", input_ty, asset_ty)
 	}
-	loader_fn(input.data, out) or_return
-	return nil
+	return loader_load(loader, input.data, out)
 }
 
 insert :: proc(asset: $T) -> Handle(T) {
@@ -199,47 +204,61 @@ find_full_asset_path :: proc(partial_path: PartialPath) -> (stat: os.File_Info, 
 	return {}, false
 }
 
-register_asset_type :: proc($T: typeid, drop: proc(this: ^T)) {
+// drop is nullable!
+register_asset_type :: proc($T: typeid, drop: proc(this: ^T) = nil) {
 	assert(!MANAGER.frozen, "Cannot register asset type after freezing manager!")
-	t_ty := typeid(T)
-	if T in MANAGER.maps[t_ty] {
-		fmt.eprintfln("Asset type {} already registered!", t_ty)
+	asset_ty: typeid = T
+	if asset_ty in MANAGER.maps {
+		fmt.eprintfln("Asset type {} already registered!", asset_ty)
 		return
 	}
-	MANAGER.maps[t_ty] = slotmap_create(T, drop)
+	MANAGER.maps[asset_ty] = transmute(SlotmapPunned)slotmap_create(T, drop)
+}
+
+
+punned_load_fn :: #type proc(
+	original_load_fn: rawptr,
+	input: rawptr,
+	output: rawptr,
+) -> (
+	err: Error
+)
+Loader :: struct {
+	original_load_fn: rawptr,
+	punned_load_fn:   punned_load_fn,
+}
+loader_load :: proc(punned: Loader, input: rawptr, output: rawptr) -> (err: Error) {
+	return punned.punned_load_fn(punned.original_load_fn, input, output)
 }
 
 register_loader :: proc(
 	$T: typeid,
 	$I: typeid,
-	$load_fn: proc(input: I) -> (this: T, error: Error),
+	load_fn: proc(input: I) -> (this: T, error: Error),
 ) {
-	if T not_in MANAGER.maps {
-		fmt.panicf("Cannot register loader for asset type {}")
-	}
-	if I == PartialPath {
+	when I == PartialPath {
 		fmt.panicf(
 			"Loaders for PartialPath cannot be registered, register loader from []u8 instead",
 		)
 	}
-	assert(T in MANAGER.maps, "Cannot register loader")
-	assert(!MANAGER.frozen, "Cannot register asset loader after freezing manager!")
+
 	asset_ty: typeid = T
 	input_ty: typeid = I
+
+	if asset_ty not_in MANAGER.maps {
+		fmt.panicf(
+			"Cannot register loader for asset type {} because there is no map for it yet!",
+			asset_ty,
+		)
+	}
+
+	assert(asset_ty in MANAGER.maps, "Cannot register loader")
+	assert(!MANAGER.frozen, "Cannot register asset loader after freezing manager!")
+
 	pair := AssetLoaderTypePair {
 		asset_ty = asset_ty,
 		input_ty = input_ty,
 	}
-
-	// to make the proc type signature compatible
-	punned_load_fn :: proc(input: rawptr, out: rawptr) -> (error: Error) {
-		input: ^I = cast(^I)input
-		local: T = load_fn(input^) or_return
-		// copy the local data to out (only if no error!)
-		(cast(^T)out)^ = local
-		return nil
-	}
-
 	if pair in MANAGER.loaders {
 		fmt.eprintfln(
 			"Asset type {} already has loader for config type {} registered!",
@@ -248,7 +267,28 @@ register_loader :: proc(
 		)
 		return
 	}
-	MANAGER.loaders[pair] = punned_load_fn
+
+	// to make the proc type signature compatible
+	punned_load_fn := proc(
+		original_load_fn: rawptr,
+		input: rawptr,
+		output: rawptr,
+	) -> (
+		error: Error,
+	) {
+		input: ^I = cast(^I)input
+		output: ^T = cast(^T)output
+		original_load_fn := cast(proc(input: I) -> (this: T, error: Error))original_load_fn
+
+		local: T = original_load_fn(input^) or_return
+		output^ = local
+		return nil
+	}
+
+	MANAGER.loaders[pair] = Loader {
+		original_load_fn = cast(rawptr)load_fn,
+		punned_load_fn   = punned_load_fn,
+	}
 }
 
 register_asset_directory :: proc(path: string) {
@@ -290,12 +330,12 @@ BoxedAny :: struct {
 	ty:  typeid,
 }
 
-@(private)
+// @(private)
 MANAGER: Manager
 Manager :: struct {
 	frozen:            bool,
 	asset_directories: [dynamic]string,
-	loaders:           map[AssetLoaderTypePair]loader_proc_punned,
+	loaders:           map[AssetLoaderTypePair]Loader,
 	maps:              map[typeid]SlotmapPunned,
 	// maps partial path to full path, bytes and all assets that were loaded from it
 	file_map:          map[PartialPath]FileMetadata,
@@ -320,16 +360,21 @@ _push_load_scope :: proc() {
 	append(&MANAGER.load_scopes, load_scope)
 }
 
-_pop_load_scope :: proc(asset: Maybe(AssetTypeAndIdx)) {
+_pop_load_scope :: proc(asset: Maybe(AssetTypeAndIdx), set_dependencies: bool = true) {
 	assert(len(MANAGER.load_scopes) > 0)
 	load_scope := pop(&MANAGER.load_scopes)
+
+	// print("--- called _pop_load_scope for", asset, load_scope.dependencies[:])
 	defer delete(load_scope.dependencies)
 	if asset, ok := asset.(AssetTypeAndIdx); ok {
-		_set_dependencies(asset, load_scope.dependencies[:])
+		if set_dependencies {
+			_set_dependencies(asset, load_scope.dependencies[:])
+		}
 		// add this asset as dependency to parent scope where this function was called
 		if len(MANAGER.load_scopes) > 0 {
 			parent_scope := &MANAGER.load_scopes[len(MANAGER.load_scopes) - 1]
 
+			print("attach to parent scope")
 			if !slice.any_of(parent_scope.dependencies[:], asset) {
 				append(&parent_scope.dependencies, asset)
 			}
@@ -339,11 +384,8 @@ _pop_load_scope :: proc(asset: Maybe(AssetTypeAndIdx)) {
 }
 
 _get_asset_metadata :: proc(asset: AssetTypeAndIdx) -> ^AssetMetadata {
-	_, meta, just_inserted, _ := map_entry(&MANAGER.asset_meta, asset)
-	if just_inserted {
-		meta.dependencies = make([dynamic]AssetTypeAndIdx)
-		meta.dependants = make([dynamic]AssetTypeAndIdx)
-	}
+	meta, ok := &MANAGER.asset_meta[asset]
+	assert(ok)
 	return meta
 }
 
@@ -370,6 +412,9 @@ _set_dependencies :: proc(asset: AssetTypeAndIdx, new_dependencies: []AssetTypeA
 		new_dep_entry := _get_asset_metadata(new_dep)
 		append(&new_dep_entry.dependants, asset)
 	}
+
+	// print("------------ set dependencies", asset)
+	// print(MANAGER.asset_meta)
 }
 
 FileMetadata :: struct {
@@ -473,7 +518,11 @@ _reload_asset :: proc(asset: AssetTypeAndIdx, input: BoxedAny) -> (err: Error) {
 
 		_load_from_bytes_punned(asset.asset_ty, file_meta.file_bytes, scratch_ptr) or_return
 	} else {
-		_load_from_input_punned(asset.asset_ty, meta.input, scratch_ptr) or_return
+		_load_from_input_punned(
+			asset.asset_ty,
+			mem.make_any(meta.input.ptr, meta.input.ty),
+			scratch_ptr,
+		) or_return
 	}
 
 	data_ptr := _slotmap_punned_data_ptr(slotmap, asset.idx)
@@ -557,8 +606,8 @@ Slot :: struct($T: typeid) {
 
 PartialPath :: distinct string
 
-slotmap_create :: proc(type: $T, drop_fn: Maybe(proc(this: ^T))) {
-	return Slotmap {
+slotmap_create :: proc($T: typeid, drop_fn: proc(this: ^T)) -> Slotmap(T) {
+	return Slotmap(T) {
 		slots = make([dynamic]Slot(T)),
 		slot_size = size_of(Slot(T)),
 		slot_data_offset = offset_of(Slot(T), data),
