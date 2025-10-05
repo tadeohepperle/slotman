@@ -88,6 +88,7 @@ _insert_asset_metadata :: proc(asset: AssetTypeAndIdx, input: any) {
 }
 
 try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(T), err: Error) {
+	asset_ty: typeid = T
 	partial_path := PartialPath(partial_path)
 	_push_load_scope()
 	defer if err != nil do _pop_load_scope(nil)
@@ -97,18 +98,13 @@ try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(
 		defer if err != nil {
 			delete_key(&MANAGER.file_map, partial_path)
 		}
-
 		stat, found_full_path := find_full_asset_path(partial_path)
 		if !found_full_path {
 			return {}, fmt.tprint("could not find full path for partial path {}", partial_path)
 		}
-		file_bytes, read_ok := os.read_entire_file_from_filename(stat.fullpath)
-		if !read_ok {
-			return {}, fmt.tprintf("could not read file at {}", stat.fullpath)
-		}
+
 		meta.full_path = strings.clone(stat.fullpath)
 		meta.last_mod_time = stat.modification_time
-		meta.file_bytes = file_bytes
 		key_ptr^ = PartialPath(strings.clone(string(partial_path)))
 	} else {
 		// if this asset type is already loaded for this path, just return it (incrementing ref count)
@@ -123,7 +119,7 @@ try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(
 	}
 
 	// parse data from bytes and insert into slotmap:
-	data: T = _load_from_bytes_typed(T, meta.file_bytes) or_return
+	data: T = _load_from_bytes_or_path_typed(T, meta) or_return
 	slotmap: ^Slotmap(T) = get_slotmap_ref(T)
 	handle = slotmap_insert(slotmap, data)
 
@@ -137,25 +133,55 @@ try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(
 	return handle, nil
 }
 
-_load_from_bytes_typed :: proc($T: typeid, bytes: []u8) -> (res: T, err: Error) {
+_load_from_bytes_or_path_typed :: proc($T: typeid, meta: ^FileMetadata) -> (res: T, err: Error) {
 	asset_ty: typeid = T
-	loader, has_bytes_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]
-	if !has_bytes_loader {
-		return {}, fmt.tprintf("no bytes loader ([]u8 -> {}) registered!", asset_ty)
+	if bytes_loader, ok := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]; ok {
+		// load from file bytes:
+		if meta.file_bytes == nil {
+			file_bytes, read_ok := os.read_entire_file_from_filename(meta.full_path)
+			if !read_ok {
+				return {}, fmt.tprintf("could not read file at {}", meta.full_path)
+			}
+			meta.file_bytes = file_bytes
+		}
+		file_bytes := meta.file_bytes.([]u8)
+		loader_load(bytes_loader, &file_bytes, &res) or_return
+	} else if path_loader, ok := MANAGER.loaders[AssetLoaderTypePair{asset_ty, string}]; ok {
+		// load from path directly:
+		assert(meta.full_path != "")
+		loader_load(path_loader, &meta.full_path, &res) or_return
+	} else {
+		return {}, fmt.tprintf("No bytes loader or path loader registered for {}!", asset_ty)
 	}
-	bytes := bytes
-	loader_load(loader, &bytes, &res) or_return
 	return res, nil
 }
 
-
-_load_from_bytes_punned :: proc(asset_ty: typeid, bytes: []u8, out: rawptr) -> (err: Error) {
-	loader, has_bytes_loader := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]
-	if !has_bytes_loader {
-		return fmt.tprintf("no bytes loader ([]u8 -> {}) registered!", asset_ty)
+_load_from_bytes_or_path_punned :: proc(
+	asset_ty: typeid,
+	meta: ^FileMetadata,
+	out: rawptr,
+) -> (
+	err: Error,
+) {
+	if bytes_loader, ok := MANAGER.loaders[AssetLoaderTypePair{asset_ty, []u8}]; ok {
+		// load from file bytes:
+		if meta.file_bytes == nil {
+			file_bytes, read_ok := os.read_entire_file_from_filename(meta.full_path)
+			if !read_ok {
+				return fmt.tprintf("could not read file at {}", meta.full_path)
+			}
+			meta.file_bytes = file_bytes
+		}
+		file_bytes := meta.file_bytes.([]u8)
+		loader_load(bytes_loader, &file_bytes, out) or_return
+	} else if path_loader, ok := MANAGER.loaders[AssetLoaderTypePair{asset_ty, string}]; ok {
+		// load from path directly:
+		assert(meta.full_path != "")
+		loader_load(path_loader, &meta.full_path, out) or_return
+	} else {
+		return fmt.tprintf("No bytes loader or path loader registered for {}!", asset_ty)
 	}
-	bytes := bytes
-	return loader_load(loader, &bytes, out)
+	return nil
 }
 
 _load_from_input_typed :: proc($T: typeid, input: any) -> (res: T, err: Error) {
@@ -229,6 +255,20 @@ Loader :: struct {
 }
 loader_load :: proc(punned: Loader, input: rawptr, output: rawptr) -> (err: Error) {
 	return punned.punned_load_fn(punned.original_load_fn, input, output)
+}
+
+register_path_loader :: proc(
+	$T: typeid,
+	from_path: proc(path: string) -> (this: T, error: Error),
+) {
+	register_loader(T, string, from_path)
+}
+
+register_bytes_loader :: proc(
+	$T: typeid,
+	from_bytes: proc(input: []u8) -> (this: T, error: Error),
+) {
+	register_loader(T, []u8, from_bytes)
 }
 
 register_loader :: proc(
@@ -330,6 +370,8 @@ BoxedAny :: struct {
 	ty:  typeid,
 }
 
+// TODO: use a perfect hash function to replace map[typeid]SlotmapPunned with []SlotmapPunned
+
 // @(private)
 MANAGER: Manager
 Manager :: struct {
@@ -341,6 +383,50 @@ Manager :: struct {
 	file_map:          map[PartialPath]FileMetadata,
 	load_scopes:       [dynamic]LoadScope,
 	asset_meta:        map[AssetTypeAndIdx]AssetMetadata,
+}
+
+@(private)
+_asset_manager_drop :: proc(manager: ^Manager) {
+	delete(manager.loaders)
+	manager.loaders = {}
+
+	for ty, &slotmap in manager.maps {
+		slotmap_punned_drop(&slotmap)
+	}
+	delete(manager.maps)
+	manager.maps = {}
+
+	for path in manager.asset_directories {
+		delete(path)
+	}
+	delete(manager.asset_directories)
+	manager.asset_directories = {}
+
+	for partial_path, meta in manager.file_map {
+		delete(string(partial_path))
+		delete(meta.full_path)
+		if file_bytes, ok := meta.file_bytes.([]u8); ok {
+			delete(file_bytes)
+		}
+		delete(meta.assets)
+	}
+	manager.file_map = {}
+
+	for l in manager.load_scopes {
+		delete(l.dependencies)
+	}
+	delete(manager.load_scopes)
+	manager.load_scopes = {}
+
+	for asset, meta in manager.asset_meta {
+		delete(meta.dependants)
+		delete(meta.dependants)
+		if meta.input.ptr != nil {
+			free(meta.input.ptr)
+		}
+	}
+	delete(manager.asset_meta)
+	manager.asset_meta = {}
 }
 
 AssetMetadata :: struct {
@@ -420,7 +506,7 @@ _set_dependencies :: proc(asset: AssetTypeAndIdx, new_dependencies: []AssetTypeA
 FileMetadata :: struct {
 	full_path:     string,
 	last_mod_time: time.Time,
-	file_bytes:    []u8,
+	file_bytes:    Maybe([]u8), // only set if any of the assets registered here use a bytes loaded instead of a path loader
 	// all assets in here should have a from_bytes loader configured!
 	assets:        [dynamic]AssetTypeAndIdx,
 }
@@ -436,24 +522,27 @@ hot_reload :: proc() {
 		meta.last_mod_time = now
 		full_path := meta.full_path
 
-		// load bytes:
-		file_bytes, read_ok := os.read_entire_file_from_filename(full_path)
-		if !read_ok {
-			fmt.eprintfln("could not read changed file at {}", full_path)
-			delete(file_bytes)
-			continue
-		}
-		// check contents:
-		old_file_bytes := meta.file_bytes
-		file_bytes_equal := slice.equal(old_file_bytes, file_bytes)
+		// if the file metadata has some bytes loaded (byte loader registered), check if the bytes changed. Only reload if changed.
+		// otherwise if bytes are nil, there are only assets with path loaders registered. In that case reload regardless.
 
-		// nothing to do if the bytes are equal
-		if file_bytes_equal {
-			delete(file_bytes)
-			continue
+		if old_file_bytes, ok := meta.file_bytes.([]u8); ok {
+			// reload bytes
+			file_bytes, read_ok := os.read_entire_file_from_filename(full_path)
+			if !read_ok {
+				fmt.eprintfln("could not read changed file at {}", full_path)
+				delete(file_bytes)
+				continue // no reload if file cannot be read!
+			}
+			file_bytes_equal := slice.equal(old_file_bytes, file_bytes)
+			if file_bytes_equal {
+				delete(file_bytes)
+				continue // no reload if file bytes are equal!
+			} else {
+				delete(old_file_bytes)
+				meta.file_bytes = file_bytes
+			}
 		} else {
-			delete(meta.file_bytes)
-			meta.file_bytes = file_bytes
+			// always reload
 		}
 
 		// go through all assets that are directly derived from the bytes of this file and reload them:
@@ -515,8 +604,7 @@ _reload_asset :: proc(asset: AssetTypeAndIdx, input: BoxedAny) -> (err: Error) {
 		partial_path: PartialPath = (cast(^PartialPath)meta.input.ptr)^
 		file_meta: FileMetadata =
 			MANAGER.file_map[partial_path] or_else panic("partial path not in map")
-
-		_load_from_bytes_punned(asset.asset_ty, file_meta.file_bytes, scratch_ptr) or_return
+		_load_from_bytes_or_path_punned(asset.asset_ty, &file_meta, scratch_ptr) or_return
 	} else {
 		_load_from_input_punned(
 			asset.asset_ty,
@@ -527,8 +615,8 @@ _reload_asset :: proc(asset: AssetTypeAndIdx, input: BoxedAny) -> (err: Error) {
 
 	data_ptr := _slotmap_punned_data_ptr(slotmap, asset.idx)
 	// drop the old value in place and put the new value in:
-	if drop_fn, ok := slotmap.drop_fn.(proc(this: rawptr)); ok {
-		drop_fn(data_ptr)
+	if slotmap.drop_fn != nil {
+		slotmap.drop_fn(data_ptr)
 	}
 	mem.copy_non_overlapping(data_ptr, scratch_ptr, slotmap.element_size)
 	_pop_load_scope(asset)
@@ -565,15 +653,29 @@ _watched_files_that_changed :: proc() -> []PartialPath {
 	return changed[:]
 }
 
-@(private)
-_asset_manager_drop :: proc(manager: ^Manager) {
-	unimplemented()
-}
-
 
 // /////////////////////////////////////////////////////////////////////////////
 // SECTION: Slotmap
 // /////////////////////////////////////////////////////////////////////////////
+
+slotmap_punned_drop :: proc(slotmap: ^SlotmapPunned) {
+	// drop all the elements in the slot map:
+	if slotmap.drop_fn != nil {
+		slots_start: uintptr = uintptr(raw_data(slotmap.slots))
+		for i := 0; i < len(slotmap.slots); i += 1 {
+			slot_ptr: uintptr = slots_start + slotmap.slot_size * uintptr(i)
+			ref_count: u32 = (cast(^u32)slot_ptr)^
+			if ref_count > 0 {
+				slot_data_ptr := rawptr(slot_ptr + slotmap.slot_data_offset)
+				slotmap.drop_fn(slot_data_ptr)
+			}
+		}
+	}
+
+	mem.free_with_size(raw_data(slotmap.slots), cap(slotmap.slots) * int(slotmap.slot_size))
+	delete(slotmap.free_list)
+}
+
 
 Handle :: struct($T: typeid) {
 	idx: u32,
@@ -584,7 +686,7 @@ SlotmapPunned :: struct {
 	slot_size:        uintptr,
 	slot_data_offset: uintptr,
 	free_list:        [dynamic]u32,
-	drop_fn:          Maybe(proc(this: rawptr)),
+	drop_fn:          proc(this: rawptr), // nullable
 	element_size:     int,
 	element_align:    int,
 }
@@ -594,7 +696,7 @@ Slotmap :: struct($T: typeid) {
 	slot_size:        uintptr,
 	slot_data_offset: uintptr,
 	free_list:        [dynamic]u32,
-	drop_fn:          Maybe(proc(this: ^T)),
+	drop_fn:          proc(this: ^T), // nullable
 	element_size:     int,
 	element_align:    int,
 }
@@ -605,6 +707,9 @@ Slot :: struct($T: typeid) {
 }
 
 PartialPath :: distinct string
+
+
+AbsolutePath :: struct {}
 
 slotmap_create :: proc($T: typeid, drop_fn: proc(this: ^T)) -> Slotmap(T) {
 	return Slotmap(T) {

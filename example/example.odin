@@ -1,5 +1,6 @@
 package example
 
+import "core:os"
 import "core:strings"
 import "core:time"
 
@@ -10,15 +11,18 @@ import "core:fmt"
 
 print :: fmt.println
 main :: proc() {
-	slotman.register_asset_type(TextFile, text_file_drop)
-	slotman.register_asset_type(TextStats, nil)
 	slotman.register_asset_directory("./example/texts")
+	slotman.register_asset_type(TextFile, text_file_drop)
+	slotman.register_asset_type(TextFileExt, text_file_ext_drop)
+	slotman.register_asset_type(TextStats, nil)
 	slotman.register_loader(TextFile, []u8, text_file_from_bytes)
+	slotman.register_loader(TextFileExt, string, text_file_ext_from_path)
 	slotman.register_loader(TextStats, []string, text_stats_from_paths)
 
 	hello_text := slotman.load_from_path(TextFile, "hello.txt")
 	moin_text := slotman.load_from_path(TextFile, "moin.txt")
 	greetings_text := slotman.load_from_path(TextFile, "greetings.txt")
+	ext_text := slotman.load_from_path(TextFileExt, "ext_test.txt")
 	text_stats := slotman.load_from_input(
 		TextStats,
 		[]string{"hello.txt", "greetings.txt", "moin.txt"},
@@ -39,6 +43,7 @@ main :: proc() {
 		print("moin_text: ", slotman.get(moin_text).content)
 		print("greetings_text: ", slotman.get(greetings_text).content)
 		print("text stats: ", slotman.get(text_stats))
+		print("ext_text: ", slotman.get(ext_text))
 	}
 
 }
@@ -99,4 +104,44 @@ text_file_from_bytes :: proc(bytes: []u8) -> (file: TextFile, err: Error) {
 		}
 	}
 	return TextFile{strings.to_string(b)}, nil
+}
+
+
+// has arbitrary requirement that the string content needs to start with "EXT", otherwise won't load
+TextFileExt :: struct {
+	content:       string,
+	path:          string,
+	creating_time: time.Time,
+}
+text_file_ext_drop :: proc(this: ^TextFileExt) {
+	delete(this.content)
+	delete(this.path)
+}
+text_file_ext_from_path :: proc(path: string) -> (file: TextFileExt, err: Error) {
+	bytes, ok := os.read_entire_file(path)
+	if !ok {
+		return {}, fmt.tprint("could not read TextFileExt from {}", path)
+	}
+	defer if err != nil do delete(bytes)
+	content := string(bytes)
+
+	print(content)
+
+	// artificial restriction to test if everything still works when file is broken
+	if !strings.starts_with(content, "EXT") {
+		return {}, "content needs to start with \"EXT\"!"
+	}
+
+	fi, stat_err := os.stat(path)
+	if stat_err != nil {
+		return {}, fmt.tprint("could not read TextFileExt from {}", path)
+	}
+	os.file_info_delete(fi)
+
+	file = TextFileExt {
+		content       = content,
+		path          = strings.clone(path),
+		creating_time = fi.creation_time,
+	}
+	return file, nil
 }
