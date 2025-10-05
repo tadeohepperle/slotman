@@ -1,5 +1,6 @@
 package example
 
+import "base:intrinsics"
 import "core:os"
 import "core:strings"
 import "core:time"
@@ -9,41 +10,60 @@ Error :: Maybe(string)
 
 import "core:fmt"
 
+type_eq_proc :: proc($T: typeid) -> proc "contextless" (_: rawptr, _: rawptr) -> bool {
+	return nil
+}
+
 print :: fmt.println
 main :: proc() {
+
+	p := type_eq_proc([]string)
+	print(p)
+
 	slotman.register_asset_directory("./example/texts")
-	slotman.register_asset_type(TextFile, text_file_drop)
-	slotman.register_asset_type(TextFileExt, text_file_ext_drop)
-	slotman.register_asset_type(TextStats, nil)
+	slotman.register_type(TextFile, text_file_drop)
+	slotman.register_type(TextFileExt, text_file_ext_drop)
+	slotman.register_type(TextStats, nil)
 	slotman.register_loader(TextFile, []u8, text_file_from_bytes)
 	slotman.register_loader(TextFileExt, string, text_file_ext_from_path)
 	slotman.register_loader(TextStats, []string, text_stats_from_paths)
 
 	hello_text := slotman.load_from_path(TextFile, "hello.txt")
 	moin_text := slotman.load_from_path(TextFile, "moin.txt")
+	// hello_text2 := slotman.load_from_path(TextFile, "hello.txt")
+	moin_text2 := slotman.load_from_path(TextFile, "moin.txt")
+
 	greetings_text := slotman.load_from_path(TextFile, "greetings.txt")
 	ext_text := slotman.load_from_path(TextFileExt, "ext_test.txt")
-	text_stats := slotman.load_from_input(
-		TextStats,
-		[]string{"hello.txt", "greetings.txt", "moin.txt"},
-	)
+	text_stats := slotman.load(TextStats, []string{"hello.txt", "greetings.txt", "moin.txt"})
 
-	// print("dependencies:")
-	// for a, d in slotman.MANAGER.asset_meta {
-	// 	print(a)
-	// 	print("   dependencies:", d.dependencies[:])
-	// 	print("   dependants:", d.dependants[:][:])
-	// }
 
+	first_time := true
 	for {
-		time.sleep(time.Millisecond * 200)
-		slotman.hot_reload()
-		print("---------------------------------------------")
-		print("hello_text: ", slotman.get(hello_text).content)
-		print("moin_text: ", slotman.get(moin_text).content)
-		print("greetings_text: ", slotman.get(greetings_text).content)
-		print("text stats: ", slotman.get(text_stats))
-		print("ext_text: ", slotman.get(ext_text))
+		time.sleep(time.Millisecond * 100)
+		any_changes := slotman.hot_reload()
+		if any_changes || first_time {
+			first_time = false
+			print("---------------------------------------------")
+			print("hello_text: ", hello_text, slotman.get(hello_text).content)
+			print("moin_text: ", moin_text, slotman.get(moin_text).content)
+			print("moin_text2: ", moin_text2, slotman.get(moin_text2).content)
+			print("greetings_text: ", slotman.get(greetings_text).content)
+			print("text stats: ", slotman.get(text_stats))
+			print("ext_text: ", slotman.get(ext_text))
+
+			print("dependencies:")
+			for a, d in slotman.MANAGER.asset_metadata {
+				print("   ", a)
+				print("       files:", d.file_dependencies[:])
+				print("       dependencies:", d.dependencies[:])
+				print("       dependants:", d.dependants[:][:])
+			}
+
+			// for path, meta in slotman.MANAGER.file_cache {
+			// 	print(path, "dependants: ", meta.dependants[:])
+			// }
+		}
 	}
 
 }
