@@ -16,14 +16,13 @@ type_eq_proc :: proc($T: typeid) -> proc "contextless" (_: rawptr, _: rawptr) ->
 
 print :: fmt.println
 main :: proc() {
-
 	p := type_eq_proc([]string)
 	print(p)
 
 	slotman.register_asset_directory("./example/texts")
-	slotman.register_type(TextFile, text_file_drop)
-	slotman.register_type(TextFileExt, text_file_ext_drop)
-	slotman.register_type(TextStats, nil)
+	slotman.register_asset_type(TextFile, text_file_drop)
+	slotman.register_asset_type(TextFileExt, text_file_ext_drop)
+	slotman.register_asset_type(TextStats, nil)
 	slotman.register_loader(TextFile, []u8, text_file_from_bytes)
 	slotman.register_loader(TextFileExt, string, text_file_ext_from_path)
 	slotman.register_loader(TextStats, []string, text_stats_from_paths)

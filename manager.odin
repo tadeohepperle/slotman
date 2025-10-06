@@ -26,6 +26,10 @@ get :: proc(handle: Handle($T)) -> T {
 	return slotmap_get(get_slotmap(T), handle)
 }
 
+try_get :: proc(handle: Handle($T)) -> (t: T, ok: bool) {
+	return slotmap_try_get(get_slotmap(T), handle)
+}
+
 insert :: proc(data: $T) -> Handle(T) {
 	slotmap := get_slotmap_ref(T)
 	return slotmap_insert(slotmap, data)
@@ -137,6 +141,19 @@ load_from_path :: proc($T: typeid, path: string) -> Handle(T) {
 	}
 	return res
 }
+
+// try_load_from_path_and_get :: proc(
+// 	$T: typeid,
+// 	partial_path: string,
+// ) -> (
+// 	handle: Handle(T),
+// 	data: T,
+// 	err: Error,
+// ) {
+// 	handle = try_load(T, partial_path) or_return
+// 	return handle, get(handle), nil
+// }
+
 try_load_from_path :: proc($T: typeid, partial_path: string) -> (handle: Handle(T), err: Error) {
 	return try_load(T, partial_path)
 }
@@ -159,8 +176,6 @@ try_load :: proc($T: typeid, input: any) -> (handle: Handle(T), err: Error) {
 	input_ty: typeid = input.id
 	input_data: rawptr = input.data
 
-	defer print("return try load:", asset_ty, handle)
-
 	pair := AssetAndInputType{asset_ty, input_ty}
 	input_cache, has_input_cache := &MANAGER.input_caches[pair]
 	if !has_input_cache {
@@ -172,7 +187,6 @@ try_load :: proc($T: typeid, input: any) -> (handle: Handle(T), err: Error) {
 		for elem in input_cache.elements {
 			if input_cache.input_eq_fn(elem.boxed_input, input_data) {
 				// found the right asset!
-				print(asset_ty, "input: ", input, "found: ", get(Handle(T){elem.asset_idx}))
 				handle = Handle(T){elem.asset_idx}
 				clone_handle(handle)
 				_pop_load_scope(AssetTypeAndIdx{asset_ty, handle.idx}, false)
@@ -180,7 +194,6 @@ try_load :: proc($T: typeid, input: any) -> (handle: Handle(T), err: Error) {
 			}
 		}
 	}
-	print(asset_ty, "input: ", input, "no early return")
 
 	// determine which loader to use: always loader for this input type except for string (partial path) as input bytes loader can be used
 	use_bytes_loader: bool = false
@@ -263,7 +276,7 @@ _get_or_insert_file_metadata :: proc(
 		stat := _find_full_path(partial_path) or_return
 		owned_partial_path := PartialPath(strings.clone(string(partial_path)))
 		MANAGER.file_cache[owned_partial_path] = FileMetadata {
-			full_path     = stat.fullpath,
+			full_path     = strings.clone(stat.fullpath),
 			last_mod_time = stat.modification_time,
 			file_bytes    = nil,
 			dependants    = make([dynamic]AssetTypeAndIdx),
@@ -303,7 +316,7 @@ _find_full_path :: proc(partial_path: PartialPath) -> (stat: os.File_Info, err: 
 }
 
 // drop is nullable!
-register_type :: proc($T: typeid, drop: proc(this: ^T) = nil) {
+register_asset_type :: proc($T: typeid, drop: proc(this: ^T) = nil) {
 	assert(!MANAGER.frozen, "Cannot register type after freezing manager!")
 	asset_ty: typeid = T
 	if asset_ty in MANAGER.storage {
@@ -502,6 +515,10 @@ InputCacheElement :: struct {
 	boxed_input: rawptr,
 }
 
+drop_all_assets :: proc() {
+	_asset_manager_drop(&MANAGER)
+	MANAGER = {}
+}
 
 @(private)
 _asset_manager_drop :: proc(manager: ^Manager) {
@@ -809,7 +826,7 @@ _watched_files_that_changed :: proc() -> []PartialPath {
 		full_path := meta.full_path
 		stats, stat_err := os.stat(full_path)
 		if stat_err != nil {
-			fmt.eprintfln("File {} cannot be checked: {}", full_path, stat_err)
+			fmt.eprintfln("File {} {} cannot be checked: {}", partial_path, full_path, stat_err)
 			continue
 		}
 		if time.diff(meta.last_mod_time, stats.modification_time) > 0 {
@@ -908,6 +925,15 @@ slotmap_get :: proc(slotmap: Slotmap($T), handle: Handle(T)) -> T {
 	return slot.data
 }
 
+slotmap_try_get :: proc(slotmap: Slotmap($T), handle: Handle(T)) -> (t: T, ok: bool) {
+	if handle.idx >= u32(len(slotmap.slots)) {
+		return {}, false
+	}
+	slot: Slot(T) = slotmap.slots[handle.idx]
+	assert(slot.ref_count > 0)
+	return slot.data, true
+}
+
 slotmap_get_ref_count :: proc(slotmap: Slotmap($T), handle: Handle(T)) -> u32 {
 	slot: Slot(T) = slotmap.slots[handle.idx]
 	assert(slot.ref_count > 0)
@@ -915,14 +941,13 @@ slotmap_get_ref_count :: proc(slotmap: Slotmap($T), handle: Handle(T)) -> u32 {
 }
 
 // returns true if ref count reduced to 0
-slotmap_remove :: proc(slotmap: ^Slotmap($T), handle: Handle(T)) {
+slotmap_remove :: proc(slotmap: ^Slotmap($T), handle: Handle(T)) -> bool {
 	slot: ^Slot(T) = &slotmap.slots[handle.idx]
 	assert(slot.ref_count > 0)
 	slot.ref_count -= 1
 	if slot.ref_count == 0 {
-		asset_ctx := _new_asset_context()
-		if drop_fn, has_drop_fn := slotmap.drop_fn.?; has_drop_fn {
-			drop_fn(&slot.data, asset_ctx)
+		if slotmap.drop_fn != nil {
+			slotmap.drop_fn(&slot.data)
 		}
 		slot.data = {}
 		append(&slotmap.free_list, handle.idx)
